@@ -1,3 +1,5 @@
+import queue
+import threading
 from core.devices.driver import Driver
 from primitives.parameter import Parameter
 from primitives.folder import Folder
@@ -5,9 +7,9 @@ from core.machine.drivers.A3200StatusItem import A3200StatusItem
 from core.machine.drivers.A3200AxisStatus import A3200AxisStatus
 
 import ctypes as ct
-from ctypes import wintypes
 import time
 import collections
+import os
 
 from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
@@ -29,12 +31,13 @@ class A3200_NPAQ(Driver):
         __desc__ = {
             'default_task' : 'Default task for A3200 driver',
             'simulation' : 'If true, will not execute commands on physical hardware -- only run in software mode',
-            'dll_path' : 'Filepath to the directory containing the A3200 dynamic linked library (DLL) files (.dll)'
+            'dll_path' : 'Filepath to the directory containing the A3200 dynamic linked library (DLL) files (.dll)',
+            'default_motion_speed': 'The default speed (F-Rate) to move axes during jog, travel, or when speed is not defined'
         }
         super().__init__()
         empty_folder = Folder()
         self.task = Parameter(name='Default Task Number', description=__desc__['default_task'], value=0,allowed_types=['int'],units='')
-        self.simulation = Parameter(name='Simulation Mode', description=__desc__['simulation'], value=False, allowed_values=[True,False],allowed_types=['bool'])
+        self.simulation = Parameter(name='Simulation Mode', description=__desc__['simulation'], value=True, allowed_values=[True,False],allowed_types=['bool'])
         self.dll_path = Parameter(name='DLL Path',description=__desc__['dll_path'], value=empty_folder, allowed_types=['Folder'])
         self.default_motion_speed = Parameter(name='Default motion speed',description=__desc__['default_motion_speed'], value=20.0, allowed_types=['float'], units='mm/s')
 
@@ -47,17 +50,27 @@ class A3200_NPAQ(Driver):
         if self.handle : self.A3200_is_open =True
 
         self.queue_status = [0]*self.max_tasks
+        self.queue_return = None
+        self.queue_process = None
+        self.queue_poll_time = 0.05 #seconds
 
     def connect(self):
         '''
             Connect to the A3200 driver and return a handle
         '''
-        if not self.A3200_lib:
-            self.A3200_lib = ct.WinDLL(self.dll_path.value)
-        
+        if TYPE_CHECKING:
+            self.dll_path.value = cast('Folder',self.dll_path.value)
+       
         if self.simulation.value:
             print('Initializing A3200 in simulation mode')
             return None, self.A3200_lib
+
+        if not self.A3200_lib:
+            try:
+                self.A3200_lib = ct.WinDLL(os.path.join(self.dll_path.value.path,'A3200.dll'))
+            except:
+                self.A3200_is_open = False
+                raise A3200Exception('A3200:connect', 'Failed to connect', 'estop')
         
         if not self.A3200_is_open:
             handle = ct.c_void_p()
@@ -155,23 +168,23 @@ class A3200_NPAQ(Driver):
             if not success: 
                 raise A3200Exception(source='A3200:linear',message=f'A3200 command fail {success}', level='estop')
 
-    def linear_velocity(self, axes:'list[Axis]', distances:list[float], speeds: list[float] | None=None, task:int | None=None):
+    def linear_velocity(self, axes:'list[Axis]', distances:list[float], speed: float | None=None, task:int | None=None):
         '''
             Make a (G1) linear coordinated point-to-point motion on axes by a specified distance
-            at the specified speeds
+            at the specified coordinated speed (F-Rate)
             NOTE: Fails if more than four axes specified and ITAR controls enabled on hardware
         '''
         if self.A3200_is_open:
-            if speeds is None: speeds = [self.default_motion_speed.value]*len(axes)
+            speeds = [0.0]*len(axes) 
             
-            sorted_axes, sorted_distances, sorted_speeds = self.sort_axes(axes=axes, distances=distances, speeds=speeds)
+            sorted_axes, sorted_distances, _ = self.sort_axes(axes=axes, distances=distances, speeds=speeds)
             #Convert python floats to c doubles
             d = (ct.c_double * len(sorted_distances))(*sorted_distances)
-            s = (ct.c_double * len(sorted_speeds))(*sorted_speeds)
+            F = DOUBLE(speed)
 
             ax_mask = self.get_axis_mask(axes=sorted_axes)
             task = task if task is not None else self.task.value
-            success = self.A3200_lib.A3200MotionLinearVelocity(self.handle, ax_mask,d,s)
+            success = self.A3200_lib.A3200MotionLinearVelocity(self.handle, ax_mask,d,F)
             if not success: 
                 raise A3200Exception(source='A3200:linear_velocity',message=f'A3200 command fail {success}', level='estop')
                 
@@ -354,7 +367,7 @@ class A3200_NPAQ(Driver):
             timeout = ct.c_int(timeout)
             return self.A3200_lib.A3200ProgramStopAndWait(self.handle, task, timeout)
 
-    def sort_axes(self, axes: 'list[Axis]', distances: list[float], speeds:list[float]) -> tuple[list[Axis], list[float], list[float]]:
+    def sort_axes(self, axes: 'list[Axis]', distances: list[float], speeds:list[float]) -> 'tuple[list[Axis], list[float], list[float]]':
         # Pair each Axis object with its corresponding distance
         grouped = list(zip(axes, distances,speeds))
 
@@ -412,9 +425,9 @@ class A3200_NPAQ(Driver):
             ax = ct.c_int(axis.driver_index.value)
             w = ct.c_uint16(word)
             di_return = ct.c_uint(0)
-            success = self.A3200_lib.A3200IOAnalogInput(self.handle,task, w,ax,ct.byref(di_return))
+            success = self.A3200_lib.A3200IODigitalInput(self.handle,task, w,ax,ct.byref(di_return))
             if not success:
-                raise A3200Exception('A3200:analog_input', 'Analog Input function failed', 'e-stop')
+                raise A3200Exception('A3200:digital_input', 'Digital Input function failed', 'e-stop')
             return di_return.value
         
     def digital_output(self,axis:'Axis', word:int, value:int, task:int|None=None):
@@ -423,22 +436,54 @@ class A3200_NPAQ(Driver):
             ax = ct.c_int(axis.driver_index.value)
             w = ct.c_uint16(word)
             val = ct.c_uint32(value)
-            success = self.A3200_lib.A3200IOAnalogOutput(self.handle,task, w,ax,val)
+            success = self.A3200_lib.A3200IODigitalOutput(self.handle,task, w,ax,val)
             if not success:
-                raise A3200Exception('A3200:analog_input', 'Analog Input function failed', 'e-stop')
+                raise A3200Exception('A3200:digital_output', 'Digital Output function failed', 'e-stop')
             return success
 # '''
 #     Status Commands
 # '''
+    def enable_queue_mode(self,task:int | None = None) -> bool | None:
+        if self.A3200_is_open:
+            task = task if task is not None else self.task.value
+            if self.queue_status[task] == 0:
+                if self.A3200_lib.A3200ProgramInitializeQueue(self.handle,task):
+                    self.queue_status[task].value = 1
+                    self.queue_return = queue.Queue()
+                    self.queue_process = threading.Thread(
+                        target=self.queue_monitor,
+                        args=(task)
+                    )
+    def disable_queue_mode(self, task:int|None=None, wait_until_empty:bool=True) -> bool | None:
+        if self.A3200_is_open:
+            task = task if task is not None else self.task.value
+            if self.queue_status[task] > 0:
+                time.sleep(self.queue_poll_time)
+                self.set_task_variables(50,[0])
+
+                if wait_until_empty:
+                    while self.get_queue_depth() > 1:
+                        time.sleep(self.queue_poll_time)
+                self.queue_status[task] = 0
+                time.sleep(self.queue_poll_time)
+                self.queue_process.join()
+                return bool(self.A3200_lib.A3200ProgramStop(self.handle.task))
+            
     def queue_monitor(self, task: int):
         if self.A3200_is_open:
+            task = task if task is not None else self.task.value
             bf = 100
             empty = ' '*bf
             error_string = ct.c_buffer(empty.encode('utf-8'))
             buffer_size = ct.c_int(bf)
             while self.queue_status[task] != 0:
                 depth = self.get_queue_depth[task]
-            self.A3200_lib.A3200Lib.A3200GetLastErrorString(error_string,buffer_size)
+                time.sleep(self.queue_poll_time)
+                if depth < 2:
+                    success = self.cmd_exe(f'WAIT(TASKSTATUS({int(task)}, DATAITEM_QueueLineCount)>1) 10000')
+                    self.A3200_lib.A3200GetLastErrorString(error_string,buffer_size)
+                    self.queue_return.put(f'{success}, {error_string.value}')
+            self.queue_status[task].value = 0
 
     def get_queue_depth(self,task:int|None=None) -> int | None:
         if self.queue_status[task] > 0:
@@ -624,18 +669,103 @@ class A3200_NPAQ(Driver):
         ]
         self.A3200_lib.A3200VariableSetValueByName.restype = ct.c_bool
 
-    def get_task_variables(self, start_intex:int, count:int=1, task: int | None=None)  -> list[float]:
+    def set_task_variables(self, start_index:int, variables:list[float]|None= None, task: int|None=None)  -> list[float]:
+        if self.A3200_is_open and not self.simulation.value:
+            task = task if task is not None else self.task.value
+            variables = variables if variables is not None else [1.0]
+            c_variables = (DOUBLE * variables)()
+            c_start_index = DWORD(start_index)
+            c_count = DWORD(len(variables))
+            success = self.A3200_lib.A3200VariableSetTaskDoubles(self.handle, task, c_start_index, c_variables, c_count)
+            if success:
+                return [float(v) for v in c_variables]
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured setting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib)    
+
+    def get_task_variables(self, start_index:int, count:int=1, task: int | None=None)  -> list[float]:
         if self.A3200_is_open and not self.simulation.value:
             task = task if task is not None else self.task.value
             c_variables = (DOUBLE * count)()
-            c_start_index = DWORD(start_intex)
+            c_start_index = DWORD(start_index)
             c_count = DWORD(count)
             success = self.A3200_lib.A3200VariableGetTaskDoubles(self.handle, task, c_start_index, c_count)
             if success:
                 return [float(v) for v in c_variables]
             else:
                 raise A3200Exception('A3200:get_task_variables','Error occured getting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib) 
+            
+    def set_global_variables(self, start_index:int, variables:list[float]|None= None)  -> list[float]:
+        if self.A3200_is_open and not self.simulation.value:
+            variables = variables if variables is not None else [1.0]
+            c_variables = (DOUBLE * variables)()
+            c_start_index = DWORD(start_index)
+            c_count = DWORD(len(variables))
+            success = self.A3200_lib.A3200VariableSetGlobalDoubles(self.handle, c_start_index, c_variables, c_count)
+            if success:
+                return [float(v) for v in c_variables]
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured setting A3200 global variables', 'estop', A3200_DLL=self.A3200_lib)    
 
+    def get_global_variables(self, start_index:int, count:int=1)  -> list[float]:
+        if self.A3200_is_open and not self.simulation.value:
+            c_variables = (DOUBLE * count)()
+            c_start_index = DWORD(start_index)
+            c_count = DWORD(count)
+            success = self.A3200_lib.A3200VariableGetGlobalDoubles(self.handle, c_start_index, c_count)
+            if success:
+                return [float(v) for v in c_variables]
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured getting A3200 global variables', 'estop', A3200_DLL=self.A3200_lib)    
+            
+    def set_task_string(self, index:int, string:str, task: int|None=None)  -> bool|None:
+        if self.A3200_is_open and not self.simulation.value:
+            task = task if task is not None else self.task.value
+            c_string = ct.create_string_buffer(string.encode('utf-8'))
+            c_index = DWORD(index)
+            success = self.A3200_lib.A3200VariableSetTaskString(self.handle, task, c_index, c_string)
+            if success:
+                return success
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured setting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib)    
+
+    def get_task_string(self, index:int, length:int=50, task: int | None=None)  -> str | None:
+        if self.A3200_is_open and not self.simulation.value:
+            task = task if task is not None else self.task.value
+            c_string = ct.create_string_buffer(b' '*length)            
+            c_index = DWORD(index)
+            c_length = DWORD(length)
+            success = self.A3200_lib.A3200VariableGetTaskString(self.handle, task, c_index, c_string, c_length)
+            if success:
+                return c_string.value
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured getting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib) 
+
+    def set_global_string(self, index:int, string:str)  -> bool|None:
+        if self.A3200_is_open and not self.simulation.value:
+            c_string = ct.create_string_buffer(string.encode('utf-8'))
+            c_index = DWORD(index)
+            success = self.A3200_lib.A3200VariableSetGlobalString(self.handle, c_index, c_string)
+            if success:
+                return success
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured setting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib)    
+
+    def get_global_string(self, index:int, length:int=50)  -> str | None:
+        if self.A3200_is_open and not self.simulation.value:
+            c_string = ct.create_string_buffer(b' '*length)            
+            c_index = DWORD(index)
+            c_length = DWORD(length)
+            success = self.A3200_lib.A3200VariableGetGlobalString(self.handle, c_index, c_string, c_length)
+            if success:
+                return c_string.value
+            else:
+                raise A3200Exception('A3200:get_task_variables','Error occured getting A3200 task variables', 'estop', A3200_DLL=self.A3200_lib)
+            
+    def set_variable(self, name:str, value:float, task: int|None=None)-> bool|None:
+        if self.A3200_is_open and not self.simulation.value:
+            c_name = ct.create_string_buffer(name.encode('utf-8'))
+            c_value = DOUBLE(value)
+            return self.A3200_lib.A3200VariableSetByName(self.handle, c_name, c_value)
 class A3200Exception(Exception):
     def __init__(self, source, message, level, *args: object, A3200_DLL=None) -> None:
         super().__init__(*args)
